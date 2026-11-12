@@ -1,0 +1,275 @@
+================================================================================
+                    LEARNINGS AND CHALLENGES
+         Multi-Client Chat System with Discovery Server
+================================================================================
+
+--------------------------------------------------------------------------------
+PART 1 — SYSTEM ARCHITECTURE (CHAT SERVER, DISCOVERY SERVER, CHAT CLIENT)
+--------------------------------------------------------------------------------
+
+LESSON 1: The Three Concurrency Models Solve the Same Problem Differently
+--------------------------------------------------------------------------
+Implementing the same chat server three times using fork(), pthreads, and
+select() made the trade-offs between concurrency models concrete rather than
+theoretical.
+
+  - Fork (process-per-client): Gives true isolation. A crash in one child
+    cannot corrupt another client's state. However, fork() is expensive: the
+    kernel must clone the entire process address space (even with CoW), update
+    page tables, and maintain a separate OS scheduler entry per child. This
+    showed up clearly in the benchmark — fork uses ~2.5-3x more CPU than
+    the other two models.
+
+  - Threads (thread-per-client): Sharing memory makes broadcast a simple loop
+    over clients[] — no IPC needed. But shared memory also means every access
+    must be mutex-protected. Getting mutex coverage right was the hardest part:
+    it is easy to call send() while holding the lock, which causes the entire
+    server to stall if one client's TCP buffer is full.
+
+  - Select (I/O multiplexing): A single thread handles all clients. No context
+    switching overhead, minimal memory, clean event-driven design. The downside
+    is that any blocking call in the event loop — such as discovery_auth() —
+    freezes all other clients. This made us appreciate why production servers
+    use non-blocking I/O everywhere.
+
+LESSON 2: IPC Design is Critical for the Fork-Based Server
+-----------------------------------------------------------
+The fork server uses socketpair(AF_UNIX, SOCK_STREAM) to create a bidirectional
+IPC channel between the parent and each child. This meant designing a complete
+internal message protocol (ipc_msg_t with typed fields: REGISTER_USER, BROADCAST,
+PRIVATE, LIST_REQ, QUIT, MSG_TO_CLIENT) on top of the TCP protocol. We learned
+that every inter-process architecture needs its own internal messaging protocol,
+which doubles the design complexity.
+
+The fixed-size struct approach (recv with MSG_WAITALL) was chosen deliberately to
+avoid partial-read issues on the IPC channel. This was a key insight: the same
+framing problem that exists on the network also exists on local IPC channels.
+
+LESSON 3: Slot Leak on Abnormal Child Exit (Critical Bug Found and Fixed)
+--------------------------------------------------------------------------
+The most significant bug discovered was in the fork server: when a child process
+crashed without sending QUIT, the parent's recv() returned 0 and the function
+silently returned without freeing the slot. Over time, slot_count was never
+decremented and the server began rejecting all new connections with "Server full"
+even with no real clients connected.
+
+The fix required understanding the full child lifecycle: a child can exit via
+three paths — clean QUIT, EOF on IPC channel, or IPC read error — and all three
+must trigger the same cleanup logic. Extracting this into a reusable cleanup_slot()
+function eliminated code duplication and made all three paths safe.
+
+Key learning: any server that maintains a fixed-size client table must handle
+abnormal disconnection as a first-class case, not an afterthought.
+
+LESSON 4: Mutex Scope Must Be Minimized
+----------------------------------------
+In the thread-based server, broadcast_all() and send_to_user() are called while
+holding clients_mutex. Since send() on a blocking TCP socket can block indefinitely
+if the target client's kernel buffer is full, holding the mutex during send() means
+a single slow client can freeze the entire server for all other users.
+
+The correct approach — snapshot the list of target sockets under the mutex, then
+release the mutex before calling send() — was identified during analysis. This
+reinforced the rule: never perform I/O while holding a lock.
+
+LESSON 5: SIGCHLD Handling Requires SA_RESTART
+------------------------------------------------
+In the fork server, SIGCHLD interrupts blocking system calls like select(). Without
+SA_RESTART, select() would return -1 with errno == EINTR after every child exits,
+causing the parent loop to spin and print "select: Interrupted system call" noise.
+Using SA_RESTART in the sigaction setup tells the kernel to automatically restart
+interrupted calls, eliminating this issue cleanly.
+
+LESSON 6: getpeername() for Trusted IP Recording
+--------------------------------------------------
+In the discovery server, the client's IP address is recorded using getpeername()
+on the server side of the TCP connection rather than accepting a client-supplied
+IP string. This was a deliberate security decision: a client cannot lie about its
+own IP address when the server reads it directly from the kernel's socket structure.
+This pattern applies broadly — never trust user-supplied network identity.
+
+LESSON 7: Graceful Shutdown Must Unregister from the Discovery Server
+----------------------------------------------------------------------
+Initially the client only closed the TCP connection on exit. This left stale
+entries in the discovery server — the user appeared registered but was unreachable.
+On reconnection, the client would receive "FAIL Username already registered" and
+could not log in again.
+
+Adding UNREGISTER to the client's shutdown sequence (called in both normal QUIT
+and EOF on stdin) fixed this. The lesson: every component that acquires a resource
+(a registry slot, a file descriptor, a lock) must have a paired release, including
+across process termination.
+
+LESSON 8: The Client's stdin/recv Race Condition
+-------------------------------------------------
+When the server disconnects, recv_thread sets running = 0, but the main thread is
+blocked in fgets(stdin). The process only exits after the user presses Enter.
+This is a classic two-thread stdin/socket race: the receive path notifies of
+shutdown, but the send path is stuck waiting for user input.
+
+The cleanest fix would be to use select() on both STDIN_FILENO and server_fd in
+the main thread, eliminating the need for a separate recv_thread altogether. This
+experience reinforced why event-driven designs are simpler to reason about than
+multi-threaded blocking I/O.
+
+--------------------------------------------------------------------------------
+PART 2 — PROTOCOL DESIGN
+--------------------------------------------------------------------------------
+
+LESSON 9: Newline Framing Is Simple but Constraining
+------------------------------------------------------
+Choosing newline (\n) as the message delimiter was the right call for this system:
+it makes all messages human-readable and testable with netcat or Telnet without
+any special tooling. During development, being able to type raw commands directly
+into nc to test the discovery server saved significant debugging time.
+
+However, newline framing has a hard constraint: message bodies cannot contain
+embedded newlines. For a chat application this is usually acceptable, but the
+lesson is that the framing choice propagates through the entire system and cannot
+easily be changed later without breaking all clients.
+
+LESSON 10: Stateless Discovery Protocol vs Stateful Chat Protocol
+-----------------------------------------------------------------
+Designing two distinct sub-protocols — one stateless (discovery, one command per
+connection) and one stateful (chat, persistent session) — forced clarity about what
+each protocol needs to track.
+
+The discovery server's one-shot design means it never needs to track sessions or
+timeouts: each command is self-contained. The chat server's persistent connection
+design means it must manage a state machine per client (UNAUTHENTICATED ->
+AUTHENTICATED) and detect disconnection. Separating these concerns into two
+servers with two protocols made each simpler and easier to test independently.
+
+LESSON 11: Delegating Authentication Is Both a Strength and a Weakness
+-----------------------------------------------------------------------
+Every LOGIN attempt causes the chat server to open a new TCP connection to the
+discovery server, perform an AUTH round-trip, and close it. This design means:
+
+  Strength: The chat server stores no credentials. Credential management is
+  centralised. All three chat server implementations share the same auth logic
+  (discovery_auth() in common.h) without duplication.
+
+  Weakness: Authentication latency depends on the discovery server's response
+  time. In the select-based server, this blocking AUTH call freezes the entire
+  event loop. This was a design tension that could only be resolved with
+  non-blocking connects to the discovery server — complexity that was not
+  implemented in this version.
+
+--------------------------------------------------------------------------------
+PART 3 — PERFORMANCE BENCHMARKING
+--------------------------------------------------------------------------------
+
+LESSON 12: All Three Servers Hit the Same Wall for the Same Reason
+------------------------------------------------------------------
+The most surprising finding was that fork, thread, and select produced nearly
+identical latency at every client count. The expected result was that select would
+be fastest (no context switching) and fork slowest (process overhead). Instead,
+all three servers degraded at exactly 10 clients with p99 > 8,400 ms.
+
+The root cause was the sequential broadcast loop shared by all three implementations:
+when a message arrives, the server writes to each client one by one. With 10 clients
+each sending ~20 messages per second, the broadcast function became the bottleneck,
+not the concurrency model. This taught us that a shared architectural flaw can mask
+the differences between concurrency models entirely.
+
+Lesson: benchmark results must be interpreted in the context of shared code paths.
+Identical results across three different architectures usually means the bottleneck
+is in code they share, not in their differences.
+
+LESSON 13: PSS vs RSS — Fork's Memory Advantage Is Hidden
+----------------------------------------------------------
+At first glance, the fork server seems memory-intensive: running 10 child processes
+sounds expensive. The RSS metric (1.50 MB) seemed to confirm this.
+
+But PSS (proportional set size) tells the true story: fork's PSS was only ~0.13 MB —
+the lowest of all three implementations — because forked children share the parent's
+read-only mapped pages via copy-on-write. The kernel counts each shared page only
+once in PSS. Thread's PSS was 0.33 MB (highest) because each thread stack is a
+private, non-shared allocation.
+
+This was a direct lesson in why PSS is the correct metric for measuring per-instance
+memory cost in systems that use fork(): RSS overestimates by up to 11.5x in this case.
+
+LESSON 14: Decreasing CPU With Increasing Load Is Not a Good Sign
+-----------------------------------------------------------------
+Thread and Select CPU usage paradoxically decreased as load increased from 5 to 10
+clients (from ~1.5% to ~0.6%). This seemed positive at first — less CPU use means
+more efficient, right?
+
+In reality this indicates the servers were spending increasing time blocked on I/O
+rather than doing useful CPU work. When every client's socket buffer is backed up
+and send() blocks, threads sit idle. The CPU goes down not because the server is
+working more efficiently, but because it is doing less actual work while latency
+climbs. Monitoring CPU alone without latency would give a completely misleading
+picture of server health.
+
+Lesson: CPU usage and latency must be monitored together. Low CPU with high latency
+is a sign of I/O blocking, not efficiency.
+
+LESSON 15: The 5-Second Monitoring Interval Was Too Coarse
+-----------------------------------------------------------
+The monitoring thread sampled /proc/<PID>/status every 5 seconds. The benchmark
+stress test ran each ramp level for 12 seconds with 5-client steps, meaning each
+step produced at most 2-3 samples. This was not enough data to see transient spikes
+or to precisely identify when degradation began within a step.
+
+A 1-second sampling interval would provide 12 data points per step, giving a much
+clearer picture of degradation onset. For future benchmarks: sample at least 10
+times per test window to have statistically meaningful data.
+
+LESSON 16: Head-of-Line Blocking Explains the Wide Latency Variance
+--------------------------------------------------------------------
+The box plots showed enormous IQR (~3,500 ms to ~10,200 ms) — delivery time varied
+by nearly 7 seconds within the same test run. This is classic head-of-line blocking:
+when the broadcast loop writes to client 1, then client 2, then client 3... client 10
+only receives its message after all 9 earlier writes complete. If any one of those
+clients has a slow socket buffer, every subsequent client in the broadcast list waits.
+
+The fix is non-blocking sockets with per-client write buffers: if one client's buffer
+is full, skip it and continue. This eliminates the head-of-line problem entirely and
+would collapse the IQR dramatically.
+
+--------------------------------------------------------------------------------
+GENERAL CHALLENGES FACED
+--------------------------------------------------------------------------------
+
+CHALLENGE 1: Managing Multiple Processes and Terminals During Development
+-------------------------------------------------------------------------
+Testing the complete system requires at minimum 4 terminals: discovery server, chat
+server, and at least 2 clients. During development it was easy to leave zombie server
+processes bound to their ports, causing "Address already in use" on the next run.
+We learned to always kill all server processes before restarting and to use
+SO_REUSEADDR on all server sockets to allow faster port recycling.
+
+CHALLENGE 2: Race Conditions Are Hard to Reproduce
+---------------------------------------------------
+The duplicate username bug in the fork server (two clients authenticating
+simultaneously with the same username before either sends REGISTER_USER to the
+parent) was identified by code review, not testing, because it requires precise
+timing to trigger. This highlighted a fundamental challenge with concurrency bugs:
+they often only appear under specific load conditions that normal testing does not
+generate. Systematic code review of all shared-state access paths is essential.
+
+CHALLENGE 3: Writing a Custom IPC Protocol on Top of Sockets
+-------------------------------------------------------------
+The fork server required designing a complete internal messaging protocol using
+fixed-size structs over socketpair file descriptors. Ensuring the struct fields were
+sized correctly (MAX_MSG vs BUFFER_SIZE mismatch causing silent truncation) and that
+recv(MSG_WAITALL) was used consistently to avoid partial reads took significant
+debugging. Partial reads on a socketpair are rare but possible under load, and the
+resulting corrupted ipc_msg_t would cause silent misbehaviour with no obvious error.
+
+
+CHALLENGE 4: Interpreting Counter-Intuitive Results
+----------------------------------------------------
+The decreasing CPU trend, the identical latency across three architectures, and the
+fork server's surprisingly low PSS all required careful analysis to interpret correctly.
+The initial instinct was to look for bugs in the measurement code. After verifying the
+measurements were correct, we had to reason from first principles about why the results
+made sense. This was the most intellectually challenging part of the benchmarking
+exercise and produced the most durable learning.
+
+
+================================================================================
+                               END OF LEARNINGS
+================================================================================

@@ -1,0 +1,79 @@
+{
+  "test": "stress",
+  "server": "thread",
+  "steps": [
+    {
+      "num_clients": 5,
+      "messages_sent": 1188,
+      "messages_recv": 4746,
+      "errors": 0,
+      "latency_mean_ms": 16.33,
+      "latency_p50_ms": 11.4,
+      "latency_p95_ms": 42.44,
+      "latency_p99_ms": 52.97,
+      "latency_max_ms": 116.07,
+      "throughput_mps": 0.25
+    },
+    {
+      "num_clients": 10,
+      "messages_sent": 2360,
+      "messages_recv": 6525,
+      "errors": 0,
+      "latency_mean_ms": 4188.06,
+      "latency_p50_ms": 4153.64,
+      "latency_p95_ms": 7940.45,
+      "latency_p99_ms": 8263.48,
+      "latency_max_ms": 8381.01,
+      "throughput_mps": 0.36
+    }
+  ],
+  "server_metrics": {
+    "label": "thread_stress",
+    "samples": 6,
+    "cpu_mean_pct": 0.93,
+    "cpu_max_pct": 1.4,
+    "rss_mean_kb": 2192,
+    "rss_max_kb": 2280,
+    "pss_mean_kb": 651,
+    "pss_max_kb": 722,
+    "csv_path": "/mnt/c/Coding/Place-Projects/Trident2/logs/thread_stress_metrics.csv"
+  },
+  "monitor_samples": [
+    {
+      "timestamp": 1794499674.9296682,
+      "cpu_pct": 1.2,
+      "rss_kb": 2112,
+      "pss_kb": 605
+    },
+    {
+      "timestamp": 1794499679.934154,
+      "cpu_pct": 1.4,
+      "rss_kb": 2112,
+      "pss_kb": 605
+    },
+    {
+      "timestamp": 1794499684.948847,
+      "cpu_pct": 1.4,
+      "rss_kb": 2280,
+      "pss_kb": 722
+    },
+    {
+      "timestamp": 1794499689.9624517,
+      "cpu_pct": 1.0,
+      "rss_kb": 2280,
+      "pss_kb": 722
+    },
+    {
+      "timestamp": 1794499694.9788544,
+      "cpu_pct": 0.6,
+      "rss_kb": 2184,
+      "pss_kb": 626
+    },
+    {
+      "timestamp": 1794499699.9847143,
+      "cpu_pct": 0.0,
+      "rss_kb": 2184,
+      "pss_kb": 626
+    }
+  ]
+}
